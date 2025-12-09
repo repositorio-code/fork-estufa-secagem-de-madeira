@@ -1,63 +1,57 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include "DHT.h" // Biblioteca para o sensor DHT11
+#include "DHT.h"
+#include <Wire.h>
+#include <Adafruit_INA219.h>
 
-// --- 1. CONFIGURAÇÕES DE REDE E MQTT (AJUSTAR) ---
+// --- 1. CONFIGURAÇÕES DE REDE E MQTT ---
 const char* ssid = "REDE";
 const char* password = "SENHA_DA_REDE";
 
-// CONFIGURAÇÕES DO BROKER
 const char* mqtt_server = "IP_DA_MAQUINA";
-const int mqtt_port = 1883; 
+const int mqtt_port = 1883;
 
-// Padrão de Inscrição da API: Estufa/+/sensor/+
-const char* ID_DO_LOTE = "LOTE_TESTE_01"; 
-const char* ID_DO_SENSOR = "ESTUFA_SENSOR_1"; 
-const char* mqtt_topic_base = "Estufa"; 
+const char* ID_DO_LOTE = "LOTE_TESTE_01";
+const char* ID_DO_SENSOR = "ESTUFA_SENSOR_1";
+const char* mqtt_topic_base = "Estufa";
 
-// --- 2. CONFIGURAÇÕES DO SENSOR DHT11 ---
-#define DHTPIN 33   
-#define DHTTYPE DHT11 
+// --- 2. CONFIGURAÇÕES DOS SENSORES ---
+#define DHTPIN 33
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
 
-// Tempo de intervalo entre leituras e publicações (em milissegundos)
+Adafruit_INA219 ina219;
+
+// --- 3. INTERVALO DE LEITURA ---
 const long interval = 5000; // 5 segundos
 unsigned long previousMillis = 0;
 
-// Variáveis para as leituras
+// --- 4. VARIÁVEIS DE LEITURA ---
 float temperatura_c = 0.0;
 float umidade_pct = 0.0;
-float ph_valor = 7.0; // valor simulado
+float ph_valor = 7.0;
+float bateria_pct = 0.0;
 
-// Inicializa o objeto DHT
-DHT dht(DHTPIN, DHTTYPE); 
-
-// --- 3. OBJETOS DE CONEXÃO ---
+// --- 5. CONEXÃO MQTT ---
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// --- FUNÇÕES ---
-
-// Função para iniciar a conexão Wi-Fi
+// --- FUNÇÕES DE CONEXÃO ---
 void setup_wifi() {
     delay(10);
     Serial.println();
     Serial.print("Conectando-se a ");
     Serial.println(ssid);
-
     WiFi.begin(ssid, password);
-
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
-
-    Serial.println("");
-    Serial.println("WiFi conectado!");
+    Serial.println("\nWiFi conectado!");
     Serial.print("Endereço IP: ");
     Serial.println(WiFi.localIP());
 }
 
-// Função para reconectar ao broker MQTT
 void reconnect() {
     while (!client.connected()) {
         Serial.print("Tentando conexão MQTT...");
@@ -72,76 +66,95 @@ void reconnect() {
     }
 }
 
-// Função para ler os sensores (Leitura Real do DHT11 + Simulação PH)
-void ler_sensores() {
-    // Leitura da umidade
-    umidade_pct = dht.readHumidity();
-    // Leitura da temperatura em Celsius
-    temperatura_c = dht.readTemperature();
+// --- FUNÇÃO PARA MEDIR A BATERIA ---
+float ler_bateria() {
+    float busVoltage = ina219.getBusVoltage_V();
+    float shuntVoltage = ina219.getShuntVoltage_mV();
+    float batteryVoltage = busVoltage + (shuntVoltage / 1000.0);
 
-    // Simulação do sensor PH
-    ph_valor = random(65, 75) / 10.0; 
+    // Conversão simples: 8.4V = 100%, 6.0V = 0%
+    float nivel = (batteryVoltage - 6.0) / (8.4 - 6.0) * 100.0;
+    if (nivel > 100) nivel = 100;
+    if (nivel < 0) nivel = 0;
 
-    // Checa se as leituras do sensor falharam
-    if (isnan(umidade_pct) || isnan(temperatura_c)) {
-        Serial.println("Falha ao ler o DHT11!");
-        // Não publica dados inválidos
-        temperatura_c = 0.0;
-        umidade_pct = 0.0;
-        return; 
-    }
+    Serial.print("Tensão da bateria: ");
+    Serial.print(batteryVoltage, 3);
+    Serial.print(" V | Nível: ");
+    Serial.print(nivel, 1);
+    Serial.println(" %");
 
-    float bateria_pct = 85.0; // Simulação porcentagem da bateria
-
-    Serial.print("T:");
-    Serial.print(temperatura_c);
-    Serial.print("°C | U:");
-    Serial.print(umidade_pct);
-    Serial.print("% | PH:");
-    Serial.println(ph_valor);
+    return nivel;
 }
 
-// Função para publicar o JSON no MQTT
+// --- FUNÇÃO PARA LER SENSORES ---
+void ler_sensores() {
+    umidade_pct = dht.readHumidity();
+    temperatura_c = dht.readTemperature();
+    ph_valor = random(65, 75) / 10.0;
+
+    if (isnan(umidade_pct) || isnan(temperatura_c)) {
+        Serial.println("Falha ao ler o DHT11!");
+        temperatura_c = 0.0;
+        umidade_pct = 0.0;
+        return;
+    }
+
+    bateria_pct = ler_bateria();
+
+    Serial.print("T: ");
+    Serial.print(temperatura_c);
+    Serial.print("°C | U: ");
+    Serial.print(umidade_pct);
+    Serial.print("% | PH: ");
+    Serial.print(ph_valor);
+    Serial.print(" | Bateria: ");
+    Serial.print(bateria_pct);
+    Serial.println("%");
+}
+
+// --- FUNÇÃO PARA PUBLICAR NO MQTT ---
 void publish_data() {
-    // Somente publica se a temperatura e umidade forem válidas (> 0)
     if (temperatura_c == 0.0 && umidade_pct == 0.0) {
         Serial.println("Dados inválidos, não publicando.");
         return;
     }
 
-    // Cria a string JSON com os dados
     String payload = "{";
-    // RF005 - Separação por Lote: O lote_id é enviado no payload
     payload += "\"lote_id\":\"" + String(ID_DO_LOTE) + "\",";
     payload += "\"temp_c\":" + String(temperatura_c) + ",";
     payload += "\"umidade_pct\":" + String(umidade_pct) + ",";
-    payload += "\"ph_valor\":" + String(ph_valor) + ","; // TODO: Implementar leitura real 
-    payload += "\"bateria_pct\":" + String(85) + ","; // TODO: Implementar leitura real
+    payload += "\"ph_valor\":" + String(ph_valor) + ",";
+    payload += "\"bateria_pct\":" + String(bateria_pct, 1) + ",";
     payload += "\"status\":\"OK\"";
     payload += "}";
 
-    // Monta o tópico final (ex: Estufa/LOTE_TESTE_01/sensor/ESTUFA_SENSOR_1)
-    // RF002 - Transmissão de Dados: Publicação no tópico MQTT
     String topic = String(mqtt_topic_base) + "/" + String(ID_DO_LOTE) + "/sensor/" + String(ID_DO_SENSOR);
 
     Serial.print("Publicando no tópico: ");
     Serial.println(topic);
     Serial.println(payload);
 
-    // Publica a mensagem
     client.publish(topic.c_str(), payload.c_str());
 }
 
-// --- FUNÇÃO PRINCIPAL (SETUP) ---
+// --- SETUP ---
 void setup() {
     Serial.begin(115200);
-    dht.begin(); // Inicializa o sensor DHT11
+    dht.begin();
 
-    setup_wifi(); // RNF002 - Conectividade Wi-Fi
+    // Inicializa INA219
+    if (!ina219.begin()) {
+        Serial.println("Falha ao inicializar INA219! Verifique conexões.");
+        while (1);
+    }
+    ina219.setCalibration_32V_2A();
+    Serial.println("INA219 inicializado com sucesso!");
+
+    setup_wifi();
     client.setServer(mqtt_server, mqtt_port);
 }
 
-// --- FUNÇÃO PRINCIPAL (LOOP) ---
+// --- LOOP PRINCIPAL ---
 void loop() {
     if (!client.connected()) {
         reconnect();
@@ -149,12 +162,9 @@ void loop() {
     client.loop();
 
     unsigned long currentMillis = millis();
-
-    // Verifica se é hora de enviar a próxima leitura
     if (currentMillis - previousMillis >= interval) {
         previousMillis = currentMillis;
-
-        ler_sensores(); 
-        publish_data(); 
+        ler_sensores();
+        publish_data();
     }
 }
